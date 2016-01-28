@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<head>
+  <script src="xpwLib.min.js"></script>
+</head>
+<body>
+  <center><h1>Arduino Due flash programmer</h1></center>
+  <div id="retrieving">Retrieving flash information...</div>
+  <div class="flash_info" style="visibility:hidden;">
+    <div style="float:left;margin-right:10px;">Flash Interface Description: </div><div id="interface_description"></div>
+    <div style="float:left;margin-right:10px;">Flash Size: </div><div id="flash_size" style="float:left;"></div><div style="margin-left:5px;">kBytes</div>
+    <div style="float:left;margin-right:10px;">Page Size: </div><div id="page_size" style="float:left;"></div><div style="margin-left:5px;">Bytes</div>
+  </div>
+  <p />
+  <div id="fileSection" style="visibility:hidden;">
+    <div>Pick a binary file to upload to the flash of the device</div>
+    <br />
+    <input type="file" id="file" name="file" />
+    <div id="props">
+      <div style="float:left;margin-right:10px;">File name: </div><div id="fileName"></div>
+      <div style="float:left;margin-right:10px;">File Size: </div><div id="fileSize" style="float:left;"></div><div style="margin-left:5px;">kBytes</div>
+      <div style="float:left;margin-right:10px;">Number of pages: </div><div id="numPages"></div>
+    </div>
+    <button id="uploadFile" type="button" style="visibility:hidden;" onclick="uploadFile()">Upload file</button>
+  </div>
+  <p />
+  <div id="flashUpdate" style="visibility:hidden;"><div>Uploading file...</div>
+    <div style="float:left;margin-right:10px;">Bytes Uploaded: </div><div id="bytesUploaded">0</div>
+    <div id="uploadConsole">Writing page </div>
+  </div>
+
+  <script>
+
+  var Line = "1";               // The one-based UART of the xPico Wi-Fi you're using ("1" or "2")
+  var CpForErase = "1";         // One-based CP pin that is connected to the Erase pin on Atmel part
+  var CpForReset = "2";         // One-based CP pin that is connected to the Reset pin on Atmel part
+
+  var flash_size;
+  var page_size;
+  var file;
+
+  var populateFlashInfo = {
+    self : null,
+    start: function() {
+      self = this;
+      xpw.serialTransmit({line: Line, message: "W400E0A04,5A000000#", done: function(data) { checkFRDY(self.readId);}})
+    },
+    readId: function() {
+      xpw.serialTransact({line: Line, message: "w400E0A0C,#", n: "12", done: function(data) {
+        document.getElementById("interface_description").innerHTML = data.message.slice(2);
+        self.readSize();
+      }});
+    },
+    readSize: function() {
+      xpw.serialTransact({line: Line, message: "w400E0A0C,#", n: "12", done: function(data) {
+        flash_size = parseInt(data.message.slice(2));
+        document.getElementById("flash_size").innerHTML = (flash_size/1024).toString();
+        self.readPageSize();
+      }});
+    },
+    readPageSize: function() {
+      xpw.serialTransact({line: Line, message: "w400E0A0C,#", n: "12", done: function(data) {
+        page_size = parseInt(data.message.slice(2));
+        document.getElementById("page_size").innerHTML = page_size.toString();
+        document.getElementById("fileSection").style.visibility = "visible";
+      }});
+    }
+  };
+
+  var checkFRDY = function(next, chars) {
+    /* This function checks the FRDY bit and, if a next function is defined calls
+    it when the FRDY bit returns 1. Otherwise keeps checking the bit.
+    */
+    chars = chars || "12";
+    /* By default, we'll wait for 12 characters, which is what it returns when
+     sam-ba is in "Terminal" mode. However, we allow to pass the number of chars
+     for the case when we're in "Normal" mode and want to pass 4
+     */
+    xpw.serialTransact({line: Line, message: "w400E0A08,#", n: chars, done: function(data) {
+      if ( data.message.slice(-1) != "0" ) {
+        if (next != null) {
+          next();
+        }
+      } else {
+        checkFRDY(next);
+      }
+    }});
+  }
+
+  var buildMessage = function(data, addr) {
+    /* This function takes the binary ArrayBuffer and converts it into the
+    commands that sam-ba understands, one word at a time.
+    */
+    var dataView = new DataView(data);
+    var msg = "";
+    for (var i=0;(i+3)<data.byteLength;i+=4) {
+    msg += "W"+(addr+i).toString(16)+","
+                +("00"+dataView.getUint8(i+3).toString(16)).slice(-2)
+                +("00"+dataView.getUint8(i+2).toString(16)).slice(-2)
+                +("00"+dataView.getUint8(i+1).toString(16)).slice(-2)
+                +("00"+dataView.getUint8(i+0).toString(16)).slice(-2)+"#";
+    }
+    return msg;
+  };
+
+  var flash = {
+    /* Call this function with:
+    data: An ArrayBuffer with binary data
+    page: The page number we're writing
+    addr: The address (0x80000 for Flash 0)
+    */
+    write: function(data, page, addr) {
+      var addr = addr || 0x80000;
+      var totalSize = data.byteLength;
+      var sent = 0;
+
+      while (sent < totalSize) {
+        var maxTransfer = Math.min(180,totalSize-sent); // Set a limit of 180 to stay under one packet size
+        var message = buildMessage(data.slice(sent,sent+maxTransfer), addr+sent);
+        sent+=maxTransfer;
+        var obj = { line: Line, message: message};
+        if(sent >= totalSize) {
+          // We're done sending this page, go and write it to flash
+          obj.done = function(ret) {
+            if (flash.onWriteEnd != null) {
+              flash.writePage(page);
+            }
+          };
+        }
+        updateCounter(maxTransfer);
+        updateConsole(".");
+        // Write the data to the latch buffer
+        xpw.serialTransmit(obj);
+      }
+    },
+    writePage: function(page) {
+      xpw.serialTransmit({line: Line, message: "W400E0A04,5A"+("0000"+page.toString(16)).slice(-4)+"03#", done: function(data) {
+        checkFRDY(flash.onWriteEnd(), "4");
+      }});
+    },
+    setNormal: function() {
+      xpw.serialTransact({line: Line, message: "N#", n: "4"});
+    }
+  }
+
+  var updateCounter = function(num) {
+    var bu = document.getElementById("bytesUploaded");
+    bu.innerHTML = (parseInt(bu.innerHTML)+num).toString();
+  }
+
+  var updateConsole = function(update) {
+    var con = document.getElementById("uploadConsole");
+    con.innerHTML = con.innerHTML + update;
+  }
+
+  var uploadFile = function() {
+    document.getElementById("flashUpdate").style.visibility = "visible";
+    var sent = 0;
+    var page = 0;
+    var reader = new FileReader();
+    reader.onloadend = function(e) {
+      if (e.target.readyState == FileReader.DONE) {
+        flash.onWriteEnd = function() {
+          updateConsole(page.toString());
+          page++;
+          sent+=page_size;
+          if (sent <= file.size) {
+            var blob = file.slice(sent,sent+page_size);
+            reader.readAsArrayBuffer(blob);
+          } else {
+            updateConsole("<br />Setting boot bit...<br />");
+            xpw.serialTransmit({line: Line, message: "W400E0A04,5A00010B#", done: function(data) {
+              updateConsole("Done!<br />Rebooting...");
+              xpw.setGpio({ gpio: CpForReset, command: "assert", done: function(data) {
+                window.setTimeout(function() {xpw.setGpio({gpio: CpForReset, command: "unassert"});},200)
+              }});
+            }});
+          }
+        }
+        flash.write(e.target.result,page,0x80000);
+      }
+    }
+    flash.setNormal();
+    var first = file.slice(0,page_size);
+    reader.readAsArrayBuffer(first);
+  }
+
+
+  function handleFileSelect(evt) {
+    file = evt.target.files[0]; // File object
+
+    document.getElementById("fileName").innerHTML = file.name
+    document.getElementById("fileSize").innerHTML = (file.size/1024).toFixed(2);
+    document.getElementById("numPages").innerHTML = Math.ceil(file.size/page_size);
+    document.getElementById("uploadFile").style.visibility = "visible";
+  }
+
+  var initAtmel = {
+    resetErase: function() {
+      xpw.setGpio({ gpio: CpForErase, command: "assertHigh"}); // Set Erase CP to active High
+      xpw.setGpio({ gpio: CpForReset, command: "assertLow"}); // Set Reset CP to active Low
+      xpw.setGpio({ gpio: CpForErase, command: "output"});
+      xpw.setGpio({ gpio: CpForReset, command: "output"});
+      xpw.setGpio({ gpio: CpForReset, command: "assert", done: function(data) {
+        xpw.setGpio({ gpio: CpForErase, command: "assert", done: function(data) {
+          window.setTimeout(function() {xpw.setGpio({ gpio: CpForReset, command: "unassert", done: function(data) {
+            window.setTimeout(function() {xpw.setGpio({ gpio: CpForErase, command: "unassert", done: function(data) {
+              window.setTimeout(function() { initAtmel.getInit();}, 200);
+            }})},200)
+          }});
+        },200);
+      }});
+    }});
+  },
+  getInit: function() {
+    xpw.setLineConfig({line: Line, items: {Protocol: "None", 'Baud Rate': "115200 bits per second"}});
+    xpw.serialTransact({line: Line, n: "4", message: "T#", done: function(data) {
+      if(data.message != "\n\r\n\r") {
+        document.getElementById("retrieving").innerHTML = "Please make sure that the Atmel processor is booted in sam-ba mode, for example by erasing the flash.";
+      } else {
+        document.getElementById("retrieving").style.visibility = "hidden";
+        document.getElementsByClassName("flash_info")[0].style.visibility = "visible";
+        populateFlashInfo.start();
+      }
+      }});
+  }
+}
+
+  window.onload = function() {
+    // Check for the various File API support.
+    if (window.File && window.FileReader && window.FileList && window.Blob) {
+      document.getElementById('file').addEventListener('change', handleFileSelect, false);
+    } else {
+      alert('The File APIs are not fully supported in this browser.');
+    }
+    /* Only call this if you have soldered wires to the ERASE pin and connected
+    the RESET pin to CPs. Otherwise you need to reset manually and call
+    initAtmel.getInit() first
+    */
+    initAtmel.resetErase();
+  };
+  </script>
+</body>
